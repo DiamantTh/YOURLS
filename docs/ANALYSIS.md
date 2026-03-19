@@ -1,461 +1,560 @@
 # YOURLS – Vollständige Architektur-, Sicherheits- und Modernisierungsanalyse
 
 > **Analysedatum:** 2026-03-19  
-> **Analysegegenstand:** YOURLS – Your Own URL Shortener  
-> **Quellen:** Quellcode, Konfigurationsdateien, Testdateien, README, composer.json
+> **Analysegegenstand:** YOURLS – Your Own URL Shortener (v1.10.4-dev)  
+> **Quellen:** Quellcode, Konfigurationsdateien, Testdateien, README, CHANGELOG, composer.json  
+> **Arbeitsmodus:** Ausschließlich read-only. Es wurden keinerlei Änderungen am Projekt vorgenommen.
 
 ---
 
 ## A. Kurzüberblick
 
-YOURLS ist ein in PHP geschriebenes, selbst gehostetes URL-Kürzsystem. Das Projekt ist historisch gewachsen, zeigt aber seit Version 1.7 erkennbare Modernisierungsschritte. Es arbeitet ohne klassisches Framework im herkömmlichen Sinne – stattdessen gibt es ein eigenes, WordPress-inspiriertes Actions/Filters-Hook-System, prozedural strukturierte Funktionsbibliotheken, eine PDO-basierte Datenbankabstraktionsschicht und seit 1.7.3 vereinzelt namespaced OOP-Klassen.
+YOURLS ist ein in PHP geschriebenes, selbst gehostetes URL-Kürzsystem. Das Projekt ist über mehr als 15 Jahre historisch gewachsen, zeigt aber seit Version 1.7 (ca. 2019) erkennbare und konsequente Modernisierungsschritte. Es arbeitet ohne klassisches MVC-Framework; stattdessen gibt es ein eigenes, WordPress-inspiriertes Actions/Filters-Hook-System, prozedural strukturierte Funktionsbibliotheken, eine PDO-basierte Datenbankabstraktionsschicht (Aura/SQL) und seit 1.7.3 vereinzelt namespaced OOP-Klassen.
 
-**Stärken:**
-- Durchgängig nutzbares, gut dokumentiertes Plugin-Hook-System (Actions/Filter)
-- Solide CSRF-Absicherung über Nonces
+**Gesamtbewertung:** Das Projekt ist für seinen Zweck funktional und stabil. Es ist kein Enterprise-System, sondern ein gezielt eingesetztes Werkzeug für Self-Hosters. Die Architektur spiegelt diesen Anspruch wider: pragmatisch, erweiterbar per Plugin, mit klaren internen Konventionen – aber auch mit erheblichen Altlasten in der Authentifizierungsschicht und ohne moderne Web-Security-Header wie CSP.
+
+### Stärken (direkt im Code beobachtet)
+- Durchgängig nutzbares, gut dokumentiertes Plugin-Hook-System (Actions/Filters)
+- CSRF-Absicherung über ein eigenes Nonce-System auf allen relevanten Formularen
 - Moderne Passwort-Hashing-Unterstützung via `password_hash()`/`password_verify()`
-- SameSite-Cookie-Attribut korrekt gesetzt
-- Klare Trennung zwischen öffentlichem und privatem Bereich (`YOURLS_PRIVATE`)
-- Gut gepflegte Testabdeckung für kritische Auth-Funktionen
+- Automatische Passwort-Migrations-Pipeline: cleartext → MD5-gesalzen → phpass → `password_hash()`
+- Cookie-Attribute korrekt gesetzt: `HttpOnly`, `SameSite=Lax`, `Secure` (abhängig von HTTPS)
+- SQL-Injection-Schutz durch PDO mit Prepared Statements (Aura/SQL)
+- Umfangreiche XSS-Schutzfunktionen (`yourls_esc_html`, `yourls_esc_attr`, `yourls_esc_url`, KSES)
+- `X-Frame-Options: SAMEORIGIN` gegen Clickjacking
+- Gute Testabdeckung: ~519 Tests in 18 Testgruppen
 
-**Schwächen / kritische Lücken:**
-- **Keine Brute-Force-/Rate-Limiting-Schutz für den Login** – kein Schutz gegen wiederholte Fehlversuche
+### Schwächen / kritische Lücken (direkt im Code beobachtet)
+- **Kein Brute-Force- / Rate-Limiting-Schutz** für den Login
 - Benutzerverwaltung vollständig in `config.php` – kein Datenbankmodell für Benutzer
-- Kein MFA-/TOTP-/FIDO2-Support in Core
-- Cookie-Wert ist deterministisch (HMAC des Benutzers, ohne Session-Token) – kein Invalidierungsmechanismus
-- Template-Architektur: HTML direkt in PHP-Funktionen – kein echtes Template-System
-- Keine CSP-Headers (`Content-Security-Policy`)
+- Kein MFA/2FA/FIDO2-Support im Core
+- Cookie-Wert ist deterministisch: `HMAC(COOKIEKEY, username)` – kein Session-Token, kein Invalidierungsmechanismus
+- Kein `Content-Security-Policy`-Header
+- Kein `X-Content-Type-Options: nosniff`-Header
+- Kein `Referrer-Policy`-Header
 - Legacy-Passwort-Hashes (MD5, cleartext) werden noch akzeptiert
+- Kein Account-Recovery-Mechanismus
+- Signatur-API erlaubt beliebige Hash-Algorithmen (`?hash=crc32` etc.)
 
 ---
 
 ## B. Architektur- und Strukturüberblick
 
 ### Sprachen und Technologien
-| Technologie | Rolle |
-|---|---|
-| PHP 7.4+ (Ziel 8.x) | Backend, gesamte Geschäftslogik |
-| MySQL / MariaDB (über PDO) | Datenspeicherung |
-| jQuery 3.5.1 | Frontend-Interaktivität |
-| CSS | Admin-Styling |
-| Composer | Dependency-Management |
+
+| Technologie | Rolle | Bewertung |
+|---|---|---|
+| PHP 8.1+ (Ziel: 8.x) | Backend, gesamte Geschäftslogik | Modern, aktuell unterstützt |
+| MySQL / MariaDB (PDO) | Datenspeicherung | Solide |
+| jQuery 3.5.1 | Frontend-Interaktivität | Veraltet (jQuery 3.5.1 = 2021) |
+| Vanilla CSS | Admin-Styling (388 Zeilen) | Minimal, kein Build-System |
+| Composer | Dependency-Management | Korrekt eingesetzt |
+| PHPUnit | Tests | Gut etabliert |
 
 ### Verzeichnisstruktur
+
 ```
 /
-├── admin/                  # Admin-Panel-Einstiegspunkte (index.php, tools.php, plugins.php, ...)
-├── includes/               # Core: Funktionsbibliotheken + Klassen
-│   ├── Config/             # Namespaced: Config.php, Init.php, InitDefaults.php
-│   ├── Database/           # Namespaced: YDB.php, Options.php, Logger.php, Profiler.php
-│   ├── Exceptions/         # Namespaced: ConfigException.php
-│   ├── Views/              # Namespaced: AdminParams.php
-│   ├── auth.php            # Auth-Bootstrap (wird via require eingebunden)
-│   ├── functions-auth.php  # Alle Auth-Funktionen
-│   ├── functions-html.php  # HTML-Ausgabe-Funktionen (Template-Surrogat)
-│   ├── functions-plugins.php # Hook-System (add_filter, do_action, ...)
-│   ├── functions.php       # Allgemeine Utility-Funktionen
-│   └── vendor/             # Composer-Dependencies
-├── user/                   # Benutzerdaten: config.php, plugins/, themes/, pages/
-│   ├── config-sample.php   # Muster-Konfiguration
-│   └── plugins/            # Bundled-Plugins (sample, hyphens, random-bg, ...)
-├── tests/                  # PHPUnit-Testsuite
-├── js/                     # Frontend-JS (jQuery, notifybar, insert, share, ...)
-├── css/                    # Admin-CSS
-└── images/                 # Logos, Icons
+├── admin/               # Admin-Panel-Einstiegspunkte
+│   ├── index.php        # URL-Liste, Suche, Filterung
+│   ├── admin-ajax.php   # AJAX-Handler
+│   ├── tools.php        # Diagnose-Werkzeuge
+│   ├── plugins.php      # Plugin-Verwaltung
+│   ├── install.php      # Erst-Installation
+│   └── upgrade.php      # DB-Upgrade
+├── includes/
+│   ├── Config/          # Namespaced OOP: Config.php, Init.php, InitDefaults.php
+│   ├── Database/        # Namespaced OOP: YDB.php, Options.php, Logger.php, Profiler.php
+│   ├── Exceptions/      # Namespaced OOP: ConfigException.php
+│   ├── Views/           # Namespaced OOP: AdminParams.php (Query-Parameter-Handling)
+│   ├── auth.php         # Auth-Dispatcher: Prüft Credentials, löst Passwort-Migration aus
+│   ├── functions-auth.php     # Alle Auth-Funktionen: Login, Cookie, Signature, Nonce
+│   ├── functions-html.php     # HTML-Rendering: Head, Footer, Login-Form, Admin-Menü
+│   ├── functions-plugins.php  # Hook-System, Plugin-Laden, Sandbox
+│   ├── functions-formatting.php  # Sanitize, Escape (XSS-Schutz)
+│   ├── functions-kses.php     # HTML-Filterung (WordPress KSES-Port)
+│   ├── functions.php          # Allgemeine Utility-Funktionen
+│   ├── load-yourls.php        # Bootstrap: Autoload, Config laden, Init
+│   └── vendor/                # Composer-Abhängigkeiten
+├── user/
+│   ├── config.php       # Benutzerkonfiguration (inkl. Passwörter!) – nicht versioniert
+│   ├── plugins/         # Benutzereigene Plugins
+│   ├── themes/          # Benutzereigene Themes (Verzeichnis vorhanden, wenig Nutzung im Core)
+│   └── pages/           # Öffentliche Seiten
+├── css/ js/             # Statische Frontend-Assets
+├── tests/               # PHPUnit-Testsuites
+└── yourls-loader.php    # Front-Controller: Routing-Eintrittspunkt
 ```
 
 ### Architekturmuster
-- **Kein MVC** im klassischen Sinne: Admin-Seiten (`admin/index.php`) enthalten direkt Logik, Datenbankabfragen und HTML-Ausgabe.
-- **Hook-System** (WordPress-inspiriert): Actions und Filter über `yourls_do_action()` und `yourls_apply_filter()`. Dies ist der primäre Erweiterungspunkt.
-- **Teilweise OOP** (seit 1.7.3): `Config`, `Init`, `YDB`, `Options` sind namespaced Klassen. Der Rest ist prozedural.
-- **Plugin-System**: Plugins in `user/plugins/`, werden über die Options-Tabelle aktiviert, laden sich selbst via Hook in `plugins_loaded`.
-- **Kein Dependency Injection Container**: Globale Variablen (`$yourls_user_passwords`, `$yourls_filters`) und Konstanten werden verwendet.
 
-### Historisch vs. modern
-| Bereich | Bewertung |
+Das System folgt keinem klassischen Framework-Muster. Es ist eine prozedurale PHP-Applikation mit funktionalen Namensräumen und einigen OOP-Klassen für neuere Subsysteme. Das Leitprinzip ist das WordPress-ähnliche Hook-System:
+
+- **Actions**: Ereignisse ohne Rückgabewert (`yourls_do_action`, `yourls_add_action`)
+- **Filters**: Datenveränderung mit Rückgabewert (`yourls_apply_filter`, `yourls_add_filter`)
+- **Shunts**: Ein spezieller Filter-Typ, der die gesamte Funktion kurzschließt und den Plugin-Autoren erlaubt, jede Kernfunktion zu überschreiben
+
+Diese Architektur macht das System sehr gut erweiterbar und gut testbar – erfordert aber globale Zustandshaltung.
+
+### Trennungsgrad von Verantwortlichkeiten
+
+| Bereich | Trennung | Bemerkung |
+|---|---|---|
+| Datenbankzugriff | Mittel | YDB-Klasse, aber überall `yourls_get_db()` in Funktionen |
+| HTML/Logik-Trennung | Schwach | HTML wird direkt in PHP-Funktionen gerendert; keine Template-Engine |
+| Auth-Logik | Gut | Zentralisiert in `functions-auth.php` und `auth.php` |
+| Plugin-System | Gut | Klar abgetrennt in `functions-plugins.php` |
+| Konfiguration | Schwach | Passwörter in PHP-Konfig-Datei, kein Trennung von Code und Credentials |
+
+### Historisch gewachsene vs. sauber geplante Bereiche
+
+| Bereich | Zustand |
 |---|---|
-| Hook-System | Ausgereift, konsistent eingesetzt |
-| Datenbankschicht (YDB/PDO) | Modern, Prepared Statements |
-| Auth-Logik | Teils veraltet (MD5, config.php-User) |
-| Template/HTML | Veraltet, hart verdrahtet |
-| Passwort-Hashing | Modern (`password_hash`, `password_verify`) |
-| JavaScript | Veraltet (jQuery 3.5.1, kein Bundler) |
-| Tests | Vorhanden, decent coverage im Auth-Bereich |
+| Bootstrap/Init (`Config/`) | Sauber geplant, OOP, seit 1.7.3 |
+| Datenbankschicht (`Database/`) | Sauber geplant, OOP, seit 1.7.3 |
+| Hook-System (`functions-plugins.php`) | Sauber, seit 1.5 |
+| Auth (`functions-auth.php`) | Historisch gewachsen, viele Legacy-Pfade |
+| HTML-Rendering (`functions-html.php`) | Historisch gewachsen, stark gekoppelt |
+| Passwort-Speicherung (`config.php`) | Technische Schuld, TODO explizit im Code vermerkt |
+| Theme-System | Rudimentär vorhanden, kaum genutzt |
 
 ---
 
-## C. Analyse der projektspezifischen Richtlinien und Dokumentation
+## C. Analyse der Richtlinien und Dokumentation
 
-### Vorhandene Dokumentation
-- `README.md`: Kurzübersicht, Verweise auf `docs.yourls.org`
-- `CHANGELOG.md`: Versionierte Änderungshistorie
-- `user/config-sample.php`: Kommentierte Musterkonfiguration
-- `tests/README.md`: Hinweise zum Ausführen der Tests
-- `tests/tests/TODO.md`: Offene Testlücken (API-Tests etc.)
-- Keine `SECURITY.md`, keine `CONTRIBUTING.md`, kein `CODE_OF_CONDUCT.md` im Repository
+### Vorhandene Richtlinien
 
-### Aus dem Code abgeleitete Regeln
-- **Kodierstandard**: Prozedural, WordPress-Stil, snake_case, `yourls_`-Präfix
-- **Passwort-Policy** (implizit): Passwörter in `config.php`, automatisches Hashing via `yourls_hash_passwords_now()`; MD5 noch unterstützt (Legacy)
-- **Session-Policy**: Cookie-basiert, 7-Tage-Lebensdauer, HttpOnly, SameSite=Lax
-- **CSRF**: Nonce-Mechanismus für alle sensitiven Aktionen
-- **Plugin-Policy**: Plugins können nahezu jeden Filter und jede Action ersetzen oder ergänzen; kein Sandbox-Mechanismus
-- **Backward Compatibility**: Stark betont – Legacy-Hashes werden weiterhin unterstützt; `functions-deprecated.php` vorhanden
+1. **README.md**: Minimalistisch. Verweis auf externe Dokumentation (docs.yourls.org). Keine internen Architekturhinweise.
+2. **CHANGELOG.md**: Gut gepflegt, chronologisch, zeigt klare Versionsstrategie. Enthält Hinweise auf API-Änderungen.
+3. **tests/README.md**: Ausführliche Anleitung zum Ausführen der Tests. Zeigt, dass Testinfrastruktur aktiv gepflegt wird.
+4. **tests/tests/TODO.md**: Vorhanden – signalisiert, dass bekannte Lücken in der Testabdeckung dokumentiert werden.
+5. **user/config-sample.php**: Konfigurationsvorlage mit Kommentaren. Dient als einzige interne "Entwicklerdokumentation" für die Konfiguration.
+6. **CONTRIBUTING**: Nicht im Repository vorhanden; Verweis im README auf externes `.github`-Repository (`YOURLS/.github/blob/master/CONTRIBUTING.md`).
+7. **SECURITY**: Nicht im Repository vorhanden.
+8. **CODE_OF_CONDUCT**: Nicht im Repository vorhanden.
+9. **Keine ADRs** (Architecture Decision Records).
+10. **Keine formalen Coding-Standards** (kein `.phpcs.xml`, kein `.php-cs-fixer.php` im Repository).
 
-### Widersprüche und Lücken
-| Bestand | Problem |
-|---|---|
-| TODO-Kommentare in `auth.php` und `functions-auth.php` | „TODO: Remove this once real user management is implemented" – deutet auf bewusste Technische Schuld hin |
-| MD5-Passwort-Support | In der Dokumentation als Legacy markiert, im Code aber vollständig aktiv |
-| `YOURLS_NO_HASH_PASSWORD` | Dokumentiert und im Code vorhanden, ermöglicht Klartextpasswörter in Production |
-| Keine `SECURITY.md` | Kein dokumentierter Prozess für Security-Disclosure |
+### Bewertung der Richtlinienkonformität
+
+- **Namenskonvention** (`yourls_` Präfix für alle Funktionen) wird konsequent eingehalten – direkt im Code beobachtet.
+- **Kommentar-/Dokumentationsstil** (PHPDoc-ähnlich) wird für öffentliche Funktionen eingehalten, ist aber nicht für alle privaten Hilfsfunktionen vorhanden.
+- **Hook-Konventionen** (shunt-Muster, filter-vor-action-Muster) werden konsequent eingehalten – direkt im Code beobachtet.
+- **Sicherheitskonventionen** (Nonce bei Formularen, Escape bei Output) werden weitgehend eingehalten.
+- **Trennung von Logik und Darstellung** ist dokumentiertes Ziel (Hooks wie `login_form_top`, `login_form_bottom`), wird aber im Core selbst nicht konsequent durchgehalten.
+
+### Dokumentationslücken
+
+- Kein formaler Sicherheitshinweis (`SECURITY.md`) – unklar, wie Sicherheitslücken gemeldet werden sollen.
+- Keine Architekturdokumentation im Repository selbst (alles extern auf docs.yourls.org).
+- Das `TODO` im Code zu echter Benutzerverwaltung (`// TODO: Remove this once real user management is implemented`) ist seit mindestens Version 1.7 vorhanden und zeigt eine langfristige technische Schuld.
 
 ---
 
 ## D. Sicherheitsanalyse
 
-### ✅ Bereits gut gelöste Bereiche
+### D.1 Authentifizierung
 
-**CSRF-Schutz:**
-Nonces für alle sensitiven Formulare und AJAX-Aktionen. Nonce-Lebensdauer konfigurierbar, HMAC-basiert (SHA-256 Standard). Logout-Aktion ebenfalls nonce-geschützt.
+**Direkt im Code beobachtet:**
 
-**Passwort-Hashing:**
-`password_hash()` mit bcrypt (DEFAULT), konfigurierbar über `hash_algo`/`hash_options`-Filter. `password_verify()` korrekt eingesetzt. Automatisches Upgrade von Klartextpasswörtern beim ersten Login.
+- Vier voneinander unabhängige Auth-Pfade in `yourls_is_valid_user()`:
+  1. Signature + Timestamp (API only)
+  2. Signature ohne Timestamp (API only)
+  3. Username + Password (Browser und API)
+  4. Cookie (Browser only)
+- Login-Nonce (`admin_login`) wird bei Browser-Logins korrekt geprüft
+- Passwort-Vergleich via `yourls_check_password_hash()` unterstützt drei Legacy-Formate plus modernen `password_hash()`-Hash
 
-**Cookie-Sicherheit:**
-`HttpOnly: true`, `SameSite: Lax`, `Secure: true` wenn SSL aktiv. Cookie-Name eindeutig je Installation (HMAC-basiert).
+**Risiken:**
 
-**SQL-Injection:**
-PDO mit Prepared Statements (`:parameter`-Syntax) konsequent eingesetzt. In `admin/index.php` werden Spaltenname/Sortierreihenfolge durch Whitelist-Validierung über `AdminParams` abgesichert.
+| Risiko | Schwere | Beleg |
+|---|---|---|
+| Kein Brute-Force-Schutz | Kritisch | Kein Rate-Limiting in `yourls_is_valid_user()` oder `yourls_check_username_password()` |
+| Legacy-Hashes (cleartext, MD5) noch akzeptiert | Hoch | `yourls_check_password_hash()` in `functions-auth.php:152` |
+| Benutzerliste in PHP-Datei | Mittel | `$yourls_user_passwords` aus `config.php` – kein DB-Schutz, keine Trennung von Credentials und Code |
+| Signatur-API erlaubt schwache Hash-Algos | Mittel | `?hash=crc32` wäre gültig; Zeile 378 in `functions-auth.php` |
+| Kein MFA/2FA | Hoch | Nicht implementiert, kein Erweiterungspunkt vorhanden |
 
-**XSS:**
-Ausgabe-Escaping über `yourls_esc_html()`, `yourls_esc_attr()`. KSES-Filter vorhanden. `X-Frame-Options: SAMEORIGIN` gesetzt.
+### D.2 Session-Handling und Cookies
 
-**Clickjacking:**
-`X-Frame-Options: SAMEORIGIN` über `yourls_no_frame_header()`.
+**Direkt im Code beobachtet:**
 
-**Flood-Schutz (URL-Erstellung):**
-`yourls_check_IP_flood()` verhindert zu schnelles Kürzen durch nicht-eingeloggte Nutzer.
+- Cookie-Name: `yourls_cookiename()` (konfigurierbar per Filter)
+- Cookie-Wert: `yourls_salt($user)` = `hash_hmac('sha256', $username, COOKIEKEY)`
+- Cookie-Attribute: `HttpOnly=true`, `SameSite=Lax`, `Secure` (abhängig von `yourls_is_ssl()`), `Domain` (parsed aus SITE-URL)
 
----
+**Risiken:**
 
-### ⚠️ Problematische Bereiche
+| Risiko | Schwere | Beleg |
+|---|---|---|
+| Cookie-Wert deterministisch (kein Session-Token) | Hoch | `yourls_cookie_value()` in `functions-auth.php:574` |
+| Keine Möglichkeit, einzelne Sessions zu invalidieren | Hoch | Logout löscht nur den eigenen Cookie; kein Server-seitiger Session-Store |
+| Cookie-Wert ändert sich nie, solange COOKIEKEY und Username gleich bleiben | Mittel | Konsequenz der deterministischen Implementierung |
+| Kein Session-Fixation-Schutz | Mittel | Kein `session_regenerate_id()` o.ä. |
 
-**Keine Brute-Force-Schutz für den Login:**
-`yourls_check_username_password()` hat kein Rate-Limiting. Ein Angreifer kann beliebig viele Passwortversuche in schneller Folge durchführen. Es gibt keinerlei Tracking von fehlgeschlagenen Anmeldeversuchen.
-> **Schweregrad: Hoch**
+### D.3 CSRF-Schutz
 
-**Cookie-Wert deterministisch:**
-`yourls_cookie_value($user)` liefert immer denselben Wert: `yourls_salt($user)`. Das bedeutet: Kennt ein Angreifer den COOKIEKEY, kann er ein gültiges Cookie für jeden bekannten Benutzernamen erzeugen. Kein serverseitiger Invalidierungsmechanismus.
-> **Schweregrad: Mittel-Hoch**
+**Direkt im Code beobachtet:**
 
-**Fehlende Security Headers:**
-- Kein `Content-Security-Policy`
-- Kein `X-Content-Type-Options: nosniff`
-- Kein `Referrer-Policy`
-> **Schweregrad: Mittel**
+Das Nonce-System ist gut implementiert:
+- Nonces sind zeitgebunden (`yourls_tick()` = ceil(time / NONCE_LIFE), Standard: 12h-Fenster)
+- Nonces sind aktiongebunden (z.B. `admin_login`, `admin_logout`)
+- Nonces sind benutzergebunden (wenn User bekannt)
+- HMAC-SHA256 als Algorithmus
+- Alle sicherheitsrelevanten Formulare und AJAX-Aktionen prüfen Nonces
 
-**Legacy-Passwort-Support:**
-MD5-Passwörter (`md5:<salt>:<hash>`) und sogar Klartextpasswörter werden weiterhin akzeptiert. Dies ist ein Migrationsweg, der enden sollte.
-> **Schweregrad: Mittel**
+**Bewertung:** Der CSRF-Schutz ist für eine prozedurale Applikation dieser Art als gut einzustufen.
 
-**Plugin-Vertrauensgrenze:**
-Plugins haben vollständigen Zugriff auf alle Filter und Actions, inklusive `shunt_is_valid_user` – ein böswilliges Plugin kann die gesamte Auth umgehen. Es gibt keine Plugin-Signing oder Sandbox.
-> **Schweregrad: Mittel (trusted-admin-only Kontext)**
+**Einschränkung:** Das Nonce-Fenster von 12h ist großzügig. Ein gestohlenes Nonce bleibt bis zu 24h gültig (altes Fenster + neues Fenster).
 
----
+### D.4 XSS-Schutz
 
-### 🔴 Potenziell kritische Bereiche
+**Direkt im Code beobachtet:**
 
-**Keine MFA/2FA:**
-Weder TOTP, noch FIDO2, noch E-Mail-Codes. Einmaliger Passwortangriff führt direkt zu vollem Zugriff.
+- `yourls_esc_html()`: `htmlspecialchars()` mit `ENT_QUOTES | ENT_SUBSTITUTE`
+- `yourls_esc_attr()`: Ähnlich, für HTML-Attribute
+- `yourls_esc_url()`: Validiert und bereinigt URLs
+- `yourls_kses()`: WordPress-Port für erlaubtes HTML (Plugin-Nachrichten, i18n)
+- `yourls_esc_js()`: JavaScript-Escaping
 
-**API-Signatur-Mechanismus (statische Signatur):**
-`?signature=md5(user_secret)` – diese Signatur ist permanent gültig und läuft nie ab. Wenn eine Signatur einmal kompromittiert ist, gibt es keine Möglichkeit, sie serverseitig zu invalidieren ohne das Passwort zu ändern. Das zeitbasierte Verfahren (`?timestamp=...&signature=...`) ist besser, ist aber nur optional.
+**Risiken:**
 
-**Passwörter in Konfigurationsdatei:**
-`$yourls_user_passwords` in `user/config.php` – wenn diese Datei durch eine Directory-Traversal-Lücke, einen Webserver-Fehler oder eine Backup-Lücke exponiert wird, sind alle Zugangsdaten kompromittiert. Dies ist kein aktiver Code-Fehler, aber ein inhärentes Risiko der Architektur.
+| Risiko | Schwere | Beleg |
+|---|---|---|
+| Kein CSP-Header (`Content-Security-Policy`) | Hoch | Nicht in `yourls_html_head()` gesetzt – plausibel vermutet, bestätigt durch Abwesenheit |
+| Inline-JavaScript im HTML (`<script>` in `yourls_login_screen()`) | Mittel | `functions-html.php:820`: `$('#username').focus();` |
+| Inline-JavaScript in Admin-Seiten | Mittel | `admin/index.php:199ff`: dynamisch generiertes `<script>` |
 
----
+### D.5 SQL-Injection
 
-### 🔍 Bereiche, die weitere Laufzeitanalyse erfordern
+**Direkt im Code beobachtet:**
 
-- Verhältnis zwischen Frontend-Output und tatsächlicher CSP-Kompatibilität
-- Verhalten bei parallelen Sessions (mehrere Browser/Geräte mit gleichem Cookie-Wert)
-- Verhalten bei aktivierten Plugins, die `shunt_is_valid_user` modifizieren
+- Aura/SQL als PDO-Wrapper mit Named Parameters
+- Alle Datenbankabfragen in `admin/index.php` verwenden Binding: `:search`, `:date_first_sql` etc.
+- `yourls_sanitize_keyword()`, `yourls_sanitize_ip()`, `yourls_sanitize_date_for_sql()` als zusätzliche Schicht
+
+**Bewertung:** Das SQL-Injection-Risiko ist gering. Prepared Statements werden konsequent verwendet.
+
+**Einschränkung:** Die Tabellen- und Spaltennamen in Queries werden nicht gebunden (das ist bei PDO technisch nicht möglich), sondern direkt interpoliert (z.B. `"ORDER BY \`$sort_by\` $sort_order"`). `$sort_by` und `$sort_order` werden in `AdminParams` validiert – dies muss korrekt sein, um SQL-Injection über diesen Weg auszuschließen. Plausibel gut, aber nicht tiefergehend verfolgt.
+
+### D.6 Weitere Sicherheitsaspekte
+
+| Aspekt | Status | Beleg |
+|---|---|---|
+| HTTP-Header: `X-Frame-Options: SAMEORIGIN` | ✅ Implementiert | `yourls_no_frame_header()` in `functions.php:357` |
+| HTTP-Header: `Content-Security-Policy` | ❌ Fehlt | Nicht in `yourls_html_head()` gesetzt |
+| HTTP-Header: `X-Content-Type-Options: nosniff` | ❌ Fehlt | Nicht gesetzt |
+| HTTP-Header: `Referrer-Policy` | ❌ Fehlt | Nicht gesetzt |
+| No-Cache für Admin-Seiten | ✅ Implementiert | `yourls_no_cache_headers()` in `functions.php:337` |
+| Plugin-Sandbox | ✅ Implementiert | `yourls_include_file_sandbox()` in `functions-plugins.php:594` |
+| Plugin-Pfad-Traversal-Schutz | ✅ Implementiert | `yourls_is_a_plugin_file()` prüft `..` und `./` |
+| Account-Recovery (Passwort-Reset) | ❌ Fehlt | Kein Mechanismus vorhanden |
+| Logging sensibler Daten | ℹ️ Unklar | `functions.php:532` loggt IP, Referrer, User-Agent – keine Passwörter |
+| Secrets in Konfig | ⚠️ Risiko | Passwörter in `config.php`; bei unsicherer Serverkonfiguration leakbar |
+| Environment-Variable-Support | ✅ Vorhanden | `YOURLS_PASSWORD`, `YOURLS_PASS`, `YOURLS_PASS_FILE` per Env-Var möglich |
+
+### D.7 API-Sicherheit
+
+Die API (`yourls-api.php`) kennt drei Authentifizierungsmethoden:
+
+1. **Username + Password** (einfachste, aber über HTTPS sicher)
+2. **Signature** (HMAC des Usernames mit COOKIEKEY, dauerhaft gültig)
+3. **Signature + Timestamp** (zeitgebunden, läuft nach `NONCE_LIFE` Sekunden ab)
+
+**Direkt im Code beobachtet – Risiken:**
+
+- Die dauerhafte Signatur (Methode 2) ist ein langlebiges, nicht rotierbares API-Token. Wird COOKIEKEY kompromittiert, sind alle Signaturen für alle Benutzer gültig.
+- Methode 3 erlaubt frei wählbare Hash-Algorithmen via `?hash=` – theoretisch könnte ein schwacher Algorithmus (`crc32`, `adler32`) gewählt werden. Zwar prüft der Code, dass der Algorithmus in `hash_algos()` existiert, aber keine Einschränkung auf kryptographisch sichere Algorithmen.
+- Kein Rate-Limiting auf API-Endpunkten.
 
 ---
 
 ## E. FIDO2-/WebAuthn-Analyse
 
-### Aktueller Auth-Flow
-```
-GET/POST → yourls_is_valid_user()
-    ├── shunt_is_valid_user (Filter – erlaubt vollständigen Ersatz)
-    ├── Logout (Nonce-geprüft)
-    ├── API: ?timestamp+?signature → yourls_check_signature_timestamp()
-    ├── API: ?signature → yourls_check_signature()
-    ├── Formular: ?username+?password → yourls_check_username_password()
-    └── Cookie → yourls_check_auth_cookie()
-```
+### E.1 Aktuelle Authentifizierungsarchitektur (Zusammenfassung)
 
-Es gibt **keine** TOTP-, FIDO2- oder andere MFA-Unterstützung. Es gibt **keinen** Benutzer-Datenbankdatensatz – Benutzer sind nur in `config.php` definiert.
+Die gesamte Auth-Logik liegt in `yourls_is_valid_user()` (`functions-auth.php:26`). Der Kontrollfluss ist eine flache if-elseif-Kaskade über vier Methoden (Signature+Timestamp, Signature, Username/Password, Cookie). Es gibt keine Abstraktion, keine Auth-Strategie-Klasse, kein Interface.
 
-### Bewertung der Integrationsfähigkeit
+Die Benutzeridentität wird in `YOURLS_USER` (PHP-Konstante) gespeichert, sobald ein Auth-Pfad erfolgreich ist. Es gibt keine Session-Objekte, kein Token-Repository, kein User-Objekt.
 
-**Architektonisch verfügbare Ansatzpunkte:**
-- `shunt_is_valid_user` (Filter): Vollständiger Ersatz der Auth-Logik – ein Plugin könnte hier WebAuthn-only implementieren
-- `login_form_top`, `login_form_bottom`, `login_form_end` (Actions): Ein Plugin kann UI-Elemente in das Login-Formular injizieren
-- `pre_login` (Action): Hook direkt vor dem eigentlichen Login-Check
-- `login`, `login_failed` (Actions): Nachgelagerte Hooks für Post-Login-Logik
+### E.2 Passt FIDO2 architektonisch in das Projekt?
 
-**Fehlende Voraussetzungen für saubere FIDO2-Integration:**
+**Mittelmäßig bis schlecht in der aktuellen Architektur – aber gut via Plugin-System.**
 
-| Voraussetzung | Status |
-|---|---|
-| Datenbankmodell für FIDO2-Credentials (credential_id, public_key, user_handle, counter) | ❌ Fehlt vollständig |
-| Benutzer-ID als stabiler Identifier (nicht nur Username in config.php) | ❌ Fehlt |
-| Challenge-Generierung und -Speicherung (Server-seitig, Session oder DB) | ❌ Fehlt |
-| Frontend JavaScript (WebAuthn API) | ❌ Fehlt |
-| Server-Side Verification Library (z.B. `web-auth/webauthn-framework`) | ❌ Fehlt |
-| Session-Persistenz für Challenges zwischen Registration und Verification | ❌ Fehlt |
+FIDO2/WebAuthn erfordert:
+1. Eine Server-seitige Speicherung von Credential-IDs und Public-Keys pro Benutzer
+2. Eine Challenge-Response-Mechanik (Server sendet Challenge, Client signiert mit privatem Schlüssel)
+3. Asynchrone Kommunikation (JavaScript `navigator.credentials.get()`)
+4. Neue Datenmodelle (Credential-Tabelle, User-Tabelle)
 
-### Mögliche Integrationsszenarien
+Das aktuelle System bietet nichts davon:
+- Keine User-Tabelle in der Datenbank
+- Keine Session-Objekte (nur deterministischer Cookie)
+- Kein modularer Auth-Dispatcher (keine "Strategy"-Abstraktion)
+- Kein modernes JavaScript-Build-System
 
-**Szenario 1: FIDO2 als Plugin (optionaler 2. Faktor)**
-*Eignung: Mittel*  
-Ein Plugin könnte nach erfolgreichem Passwort-Login (`login`-Action) einen zweiten Schritt einfordern. Das würde vorläufig ohne Datenbankänderungen auskommen (Challenge per PHP-Session). Hürde: YOURLS hat keine eigene Session-Verwaltung (`$_SESSION`), nur Cookies. Eine Plugin-seitige Nutzung von `$_SESSION` wäre möglich aber inkonsistent.
+### E.3 Theoretische Integrationspunkte
 
-**Szenario 2: FIDO2 als Kernfeature (Ersatz des Passwort-Logins)**
-*Eignung: Niedrig ohne größere Vorarbeiten*  
-Würde erfordern: neue DB-Tabelle `yourls_webauthn_credentials`, Erweiterung der Benutzeridentität (User-Handle), neue Admin-UI für Schlüsselverwaltung, komplett neuer Login-Flow. Nicht als inkrementelle Erweiterung möglich.
+| Komponente | Relevanz | Begründung |
+|---|---|---|
+| `yourls_is_valid_user()` | Hoch | Haupteintrittspunkt für Auth; müsste um FIDO2-Zweig erweitert werden |
+| `yourls_store_cookie()` | Hoch | Nach erfolgreichem FIDO2-Login müsste Session-Token gesetzt werden |
+| `yourls_login_screen()` | Hoch | Login-Formular müsste um Passkey-Button/JS-Flow erweitert werden |
+| `admin_ajax.php` | Hoch | AJAX-Handler für WebAuthn-Challenge und Response benötigt |
+| `functions-auth.php` | Hoch | Neue Funktionen: `yourls_check_webauthn()`, `yourls_webauthn_challenge()` |
+| Datenbankschema | Hoch | Neue Tabelle: `yourls_webauthn_credentials` (user_id, credential_id, public_key, aaguid, ...) |
+| `shunt_is_valid_user` Filter | Mittel | Könnte von Plugin genutzt werden, um FIDO2 zu implementieren |
+| `login_form_bottom` Action | Mittel | Plugin-Einstiegspunkt für Passkey-Button im Login-Formular |
+| `pre_login` Action | Mittel | Plugin-Einstiegspunkt für Pre-Auth-Logik |
+| CSS (`style.css`) | Niedrig | Design-Anpassung für Passkey-Button |
 
-**Szenario 3: FIDO2 nur für den Admin-Bereich via Plugin**
-*Eignung: Hoch (empfohlen als erster Schritt)*  
-Das Plugin-System ist ausdrücklich erweiterbar für Auth-Änderungen. Mit dem `shunt_is_valid_user`-Filter kann ein Plugin die gesamte Admin-Auth ersetzen. Challenges könnten in der Options-Tabelle gespeichert werden. Credential-Daten bräuchten eine eigene Tabelle (Plugin-Install kann diese anlegen).
+### E.4 Betroffene Datenmodelle
 
-### Empfohlene Zielarchitektur für FIDO2
+Aktuell gibt es **keine Benutzertabelle** in der Datenbank. FIDO2 erfordert zwingend:
 
-```
-user/plugins/webauthn/
-├── plugin.php                  # Hook-Registrierung
-├── includes/
-│   ├── class-webauthn.php      # Wrapper um webauthn-framework
-│   ├── class-credential-store.php  # DB-Abstraktion für Credentials
-│   └── functions.php           # Plugin-spezifische Hilfsfunktionen
-├── admin/
-│   ├── register.php            # UI: Neuen Schlüssel registrieren
-│   └── manage.php              # UI: Vorhandene Schlüssel verwalten
-└── js/
-    └── webauthn.js             # WebAuthn Browser API
-```
+1. **User-Tabelle** (`yourls_users`):
+   - `user_id` (int, PK)
+   - `username` (varchar)
+   - `password_hash` (varchar, nullable für passwortlosen Login)
+   - Erfordert Migration der Passwörter aus `config.php`
 
-**DB-Tabelle (Plugin-Install):**
-```sql
-CREATE TABLE yourls_webauthn_credentials (
-    id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    user_login   VARCHAR(100)    NOT NULL,
-    credential_id BLOB           NOT NULL,
-    public_key   TEXT            NOT NULL,
-    counter      BIGINT UNSIGNED NOT NULL DEFAULT 0,
-    created_at   DATETIME        NOT NULL,
-    last_used    DATETIME,
-    display_name VARCHAR(255),
-    PRIMARY KEY (id),
-    KEY user_login (user_login)
-);
-```
+2. **WebAuthn-Credential-Tabelle** (`yourls_webauthn_credentials`):
+   - `credential_id` (binary/varchar, PK)
+   - `user_id` (FK zu `yourls_users`)
+   - `public_key_credential_source` (JSON/blob)
+   - `aaguid` (varchar)
+   - `created_at`, `last_used_at`
 
-**Challenge-Speicherung**: In der Options-Tabelle mit kurzem TTL (`webauthn_challenge_<ip_hash>`), analog zum bestehenden Nonce-Mechanismus.
+### E.5 Empfohlener Modernisierungspfad für FIDO2 (nur beschreibend)
 
-### Technische Hürden
-1. **Kein Benutzer-Datenbank-Record**: Ohne stabilen User-Handle (UUID oder BIGINT ID) ist die WebAuthn-Benutzer-Zuordnung umständlich. Für ein Plugin reicht vorerst `sha256(username)`.
-2. **Kein PHP-Session-Mechanismus**: YOURLS selbst nutzt `$_SESSION` nicht. Challenges müssen in der Options-Tabelle oder einer eigenen Tabelle gespeichert werden.
-3. **Kein Composer-Abhängigkeits-Workflow für Plugins**: Das Webauthn-Framework `web-auth/webauthn-framework` muss manuell oder per eigenem Composer in das Plugin gebracht werden.
-4. **UX-Redesign für Login**: Das aktuelle Login-Formular hat keinen "Passkey"-Button. Dies ist ein kleiner, aber notwendiger Frontend-Eingriff.
+**Phase A – Voraussetzung: Echte Benutzerverwaltung**  
+Solange Benutzer und Passwörter in `config.php` stehen, ist keine sinnvolle FIDO2-Integration möglich. Eine Benutzertabelle in der Datenbank ist zwingende Voraussetzung.
+
+**Phase B – FIDO2 als optionaler zweiter Faktor (MFA)**  
+Empfehlenswerter erster Schritt: FIDO2 als optionalen zweiten Faktor nach Username/Passwort einführen. Das minimiert die Risiken und erlaubt einen graduellen Rollout. Umsetzbar als Plugin via `shunt_is_valid_user`-Filter und `login_form_bottom`-Action.
+
+**Phase C – FIDO2 als primäre Methode / passwortloser Login**  
+Erfordert vollständige User-Tabelle, JavaScript-Build-System, und erhebliche Änderungen an der Login-UX.
+
+**Fazit für FIDO2:**  
+FIDO2 ist am sinnvollsten als **optionaler zweiter Faktor via Plugin**, zumindest solange keine echte Benutzerdatenbank vorhanden ist. Der Shunt-Filter `shunt_is_valid_user` und die Login-Actions (`login_form_bottom`, `login_form_top`) bieten bereits ausreichende Integrationspunkte für eine Plugin-basierte Lösung.
 
 ---
 
-## F. Theme-/Design-/Engine-Analyse
+## F. Theme-, Design- und Engine-Analyse
 
-### Aktueller Zustand: Kein Template-System
+### F.1 Template-Ansatz
 
-YOURLS hat **kein separates Template-System**. HTML wird direkt in PHP-Funktionen ausgegeben:
+YOURLS hat **keine dedizierte Template-Engine**. HTML wird direkt in PHP-Funktionen als `echo`-Ausgabe oder `heredoc`/Inline-PHP generiert. Alle Admin-Seiten (index.php, tools.php, plugins.php etc.) folgen diesem Schema:
 
-```php
-// includes/functions-html.php
-function yourls_html_head( $context = 'index', $title = '' ) {
-    // ...
-    ?>
-    <!DOCTYPE html>
-    <html ...>
-    <head>
-    <?php
-}
+```
+yourls_html_head($context)
+yourls_html_logo()
+yourls_html_menu()
+[... page-spezifische Ausgabe ...]
+yourls_html_footer()
 ```
 
-Alle Views sind hart in Funktionen wie `yourls_html_head()`, `yourls_html_footer()`, `yourls_login_screen()`, `yourls_html_addnew()`, `yourls_table_head()` etc. eingebettet.
+**Konsequenz:** Die Darstellungslogik ist fest mit der Anwendungslogik verwoben. Es gibt keine Blade-, Twig-, Smarty- oder ähnliche Trennung. Eine Änderung am Layout erfordert PHP-Kenntnisse.
 
-### Hooks als Erweiterungsmechanismus
+### F.2 Theme-System
 
-Das Hook-System wird auch für die UI eingesetzt:
-- `pre_html_head`, `html_head` – Erweiterung des `<head>`-Bereichs
-- `html_logo`, `pre_html_logo` – Logo-Bereich
-- `html_footer` – Footer-Erweiterung
-- `admin_links`, `admin_sublinks` – Menü-Erweiterung
-- `login_form_top`, `login_form_bottom`, `login_form_end` – Login-Form-Erweiterung
+Das Theme-System ist im Code **vorbereitet aber minimal genutzt**:
 
-Dies ermöglicht Plugins, Layout-Elemente einzufügen, ist aber kein vollständiges Theming.
+- `YOURLS_THEMEDIR` und `YOURLS_THEMEURL` sind als Konstanten definiert (seit ca. 1.9)
+- `yourls_get_themes()`, `yourls_activate_theme()`, `yourls_load_theme()`, `yourls_is_style_queued()` sind als Funktionen implementiert (bestätigt durch `tests/tests/themes/ThemesTest.php`)
+- Die Tests validieren Theme-Aktivierung und Style-Queuing
+- In der Praxis betrifft das Theme-System hauptsächlich das **öffentliche Frontend** (Redirect-Seiten, Info-Seiten), nicht das Admin-Panel
 
-### Theme-Verzeichnis vorhanden
-```
-YOURLS_THEMEDIR = user/themes/
-YOURLS_THEMEURL = (site)/user/themes/
-```
-Die Konstanten existieren, aber es gibt **kein Theming-Framework** im Core. Das Theme-Verzeichnis ist leer; keine `ThemesTest.php`-Testklasse enthält derzeit konkrete Themes.
+Das Admin-Panel selbst ist nicht "themeable" über das offizielle Theme-System. Das CSS liegt direkt in `/css/style.css` (388 Zeilen vanilla CSS, kein Präprozessor, kein Build-System).
 
-### Flexibilitätsbewertung
+### F.3 Erweiterbarkeit des Designs
 
-| Aspekt | Bewertung |
+| Aspekt | Status |
 |---|---|
-| Theming-Fähigkeit | ❌ Gering – kein Theme-Mechanismus im Core |
-| Komponenten-Trennung (Logik/Darstellung) | ❌ Gemischt – HTML direkt in Funktionen |
-| Alternative Designs | ⚠️ Möglich über CSS-Override (kein Theming) |
-| Accessibility | ⚠️ Grundlegende ARIA-Rollen vorhanden (`role="main"`, `role="navigation"`) |
-| Mobile | ⚠️ Basisunterstützung (mobile CSS-Klasse gesetzt) |
-| FIDO2-/Passkey-UX | ❌ Keine UI-Grundlage vorhanden |
-| Design-Modernisierung | Aufwendig – erfordert Umbau von `functions-html.php` |
+| Admin-Panel theming | Nur per Plugin/Filter (`bodyclass`-Filter, `admin_headers`-Action) |
+| Öffentliches Frontend | Über Theme-System erweiterbar |
+| Login-Formular | Per Action-Hooks erweiterbar (`login_form_top`, `login_form_bottom`, `login_form_end`) |
+| HTML-`<head>` | Per Action-Hook `html_head_meta` |
+| Menü | Per Action-Hook `admin_menu` |
+| Seitentitel | Per Filter `html_title` |
+| CSS-Assets | Per Plugin (Style-Queue) |
+| JS-Assets | Per Plugin (Script-Queue) |
 
-### Empfehlung für Theme-System
+Das Hook-System macht das Admin-Panel gut **inkrementell** erweiterbar, aber nicht austauschbar.
 
-Als minimale, richtlinienkonforme Evolution könnte ein **Theme-Loader** eingeführt werden, der:
-1. `user/themes/<theme_name>/theme.php` lädt (analog zu Plugins)
-2. Alle bestehenden HTML-Funktionen via Filter überschreibbar macht
-3. Die `yourls_html_head()` etc. als fallback behält
+### F.4 Frontend-Technologien und deren Zustand
 
-Dies würde keine Breaking Changes einführen, aber erstmals echtes Theming ermöglichen.
+| Technologie | Version | Bewertung |
+|---|---|---|
+| jQuery | 3.5.1 (2021) | Veraltet; jQuery 3.7.1 ist aktuell. Sicherheitsrelevant: jQuery < 3.5 hatte XSS-Lücken, 3.5.1 ist gepatchte Version. |
+| Vanilla CSS | keine Version | Keine Build-Pipeline, kein Sass/Less/PostCSS |
+| JavaScript-Module | Keines | Kein Bundler (webpack, vite etc.) |
+| Accessibility | Partiell | ARIA-Attribute vorhanden (`role="main"`, `role="banner"`), aber nicht systematisch |
+
+### F.5 Eignung für moderne Auth-UX (FIDO2 / Passkey)
+
+Die Login-UI (`yourls_login_screen()`) ist einfaches HTML: zwei Felder, ein Submit-Button. Eine FIDO2-Integration würde erfordern:
+
+- Einen Passkey-Button mit `navigator.credentials.get()` JavaScript-Aufruf
+- AJAX-Kommunikation mit dem Server (Challenge → Response → Token)
+- Möglicher Einstiegspunkt: `login_form_bottom`-Action
+
+Technisch machbar, aber die fehlende JavaScript-Build-Pipeline und das fehlende JavaScript-Modul-System würden die Implementierung erschweren. Eine Plugin-basierte Lösung könnte eigene JavaScript-Dateien laden.
 
 ---
 
 ## G. Technische Schulden und Modernisierungsrisiken
 
-| Schuld | Risiko bei Umbau | Priorität |
-|---|---|---|
-| Benutzer in `config.php` statt DB | Alle Auth-Änderungen sind workarounds | Hoch |
-| MD5/Cleartext-Passwort-Support | Sicherheitsrisiko solange aktiv | Hoch |
-| Kein Brute-Force-Schutz | Direktes Angriffsvektor | Hoch (behoben in diesem PR) |
-| Cookie-Wert nicht invalidierbar | Session-Hijacking-Risiko | Mittel |
-| HTML in PHP-Funktionen | Redesign sehr aufwendig | Mittel |
-| jQuery 3.5.1 (outdated) | CVE-Risiko, Kompatibilität | Mittel |
-| Keine CSP-Headers | XSS-Mitigierung fehlt | Mittel (teilweise behoben in diesem PR) |
-| Kein Composer-Autoloading für Plugins | Plugin-Entwicklung inkonsistent | Niedrig |
-| `eval`-freies Plugin-Loading (require) | Kein aktives Risiko | Niedrig |
+### G.1 Passwörter in config.php
+
+**Das ist die größte technische Schuld des Systems.** Der Code enthält einen expliziten TODO-Kommentar:
+
+```
+// TODO: Remove this once real user management is implemented
+```
+
+Dieser Kommentar steht seit mindestens Version 1.7 im Code. Die gesamte Pipeline zur automatischen Passwort-Migration (cleartext → MD5 → phpass → password_hash) existiert nur, weil Passwörter in einer Datei gespeichert werden, die der Webserver servieren kann, wenn die PHP-Konfiguration nicht stimmt.
+
+**Folgeprobleme dieser Schuld:**
+- Kein MFA möglich
+- Keine FIDO2-Integration sinnvoll
+- Keine Benutzerselbstverwaltung (kein "Change password", kein "Forgot password")
+- Keine Rollen/Rechte pro Benutzer
+- Keine Audit-Logs pro Benutzer
+- Benutzerliste ist ein globales PHP-Array (`$yourls_user_passwords`)
+
+### G.2 Deterministischer Cookie-Wert
+
+Der Cookie-Wert ist `HMAC(COOKIEKEY, username)`. Er ändert sich nie (außer COOKIEKEY oder Username ändern sich). Das bedeutet:
+
+- Einmal gestohlener Cookie ist dauerhaft gültig
+- Logout invalidiert nur den Client-Cookie, nicht den "Wert"
+- Mehrere parallele Sessions können nicht unterschieden werden
+- Kein "Alle anderen Sessions abmelden"-Mechanismus möglich
+
+### G.3 Legacy-Auth-Formate
+
+Drei verschiedene Passwort-Formate werden noch aktiv unterstützt:
+1. Klartext
+2. MD5-gesalzen (`md5:<salt>:<md5(salt.pass)>`)
+3. phpass
+
+Dieser Code muss irgendwann entfernt werden, erhöht aber die Komplexität und die Angriffsfläche so lange er vorhanden ist.
+
+### G.4 Signatur-API mit freiem Hash-Algorithmus
+
+Der `?hash=`-Parameter erlaubt die Auswahl beliebiger Hash-Algorithmen aus `hash_algos()`. PHP's `hash_algos()` enthält auch kryptographisch unsichere Algorithmen wie `adler32`, `crc32`, `fnv`. Plausibel vermutet (nicht explizit untersucht), dass ein Angreifer mit Netzwerkzugang eine schwächere Signatur forcieren könnte.
+
+### G.5 Fehlende Security-Header
+
+Drei moderne Security-Header fehlen vollständig:
+- `Content-Security-Policy`: Würde XSS erheblich einschränken (aber erfordert Inline-JS-Refactoring)
+- `X-Content-Type-Options: nosniff`: Verhindert MIME-Type-Sniffing
+- `Referrer-Policy`: Begrenzt Referrer-Leakage
+
+Diese Header könnten theoretisch über die `admin_headers`-Action durch Plugins gesetzt werden, aber sie sind kein Teil des Core.
+
+### G.6 jQuery 3.5.1
+
+jQuery 3.5.1 enthält keine bekannten kritischen Schwachstellen (die XSS-Fixes kamen in 3.5.0), aber es ist nicht die aktuelle Version. Für zukünftige Sicherheits-Patches sollte ein Update auf jQuery 3.7.x in Betracht gezogen werden.
 
 ---
 
-## H. Konkrete Empfehlungen
+## H. Konkrete Empfehlungen (ausschließlich textuell, keine Umsetzung)
 
-### Priorität 1 – Sofortmaßnahmen (Sicherheit)
+### H.1 Kritisch (sofortiger Handlungsbedarf)
 
-1. **Brute-Force-Schutz für Login** (implementiert in diesem PR)  
-   Fehlgeschlagene Login-Versuche pro IP tracken, nach `YOURLS_LOGIN_MAX_ATTEMPTS` Versuchen für `YOURLS_LOGIN_LOCKOUT_DURATION` Sekunden sperren.
+1. **Brute-Force-Schutz für Login einführen**: Eine IP-basierte oder Username-basierte Sperre nach N Fehlversuchen sollte implementiert werden. Das könnte über die `login_failed`-Action (die bereits existiert) und die Options-Tabelle realisiert werden, ohne das Datenbankschema zu ändern.
 
-2. **Security Headers erweitern** (implementiert in diesem PR)  
-   `X-Content-Type-Options: nosniff` und `Referrer-Policy: strict-origin-when-cross-origin` hinzufügen.
+2. **Schwache Hash-Algorithmen für API-Signaturen einschränken**: Der `?hash=`-Parameter sollte auf eine Whitelist kryptographisch sicherer Algorithmen (SHA-256, SHA-512) beschränkt werden, statt alle `hash_algos()` zu erlauben.
 
-3. **Statische API-Signatur deprecaten**  
-   `?signature=md5(secret)` ohne Zeitstempel ist permanent gültig. Nutzer sollten zur zeitbasierten Signatur migriert werden.
+3. **Fehlende Security-Header hinzufügen**: `X-Content-Type-Options: nosniff` und `Referrer-Policy: strict-origin-when-cross-origin` können ohne Nebeneffekte sofort gesetzt werden. Ein `Content-Security-Policy`-Header erfordert vorherige Arbeit an Inline-JavaScript und -CSS.
 
-4. **MD5-Passwort-Migration**  
-   Nach hinreichend langer Übergangszeit sollte die Unterstützung für MD5-Passwörter enden und Nutzer zum Re-Hashing mit bcrypt gezwungen werden.
+### H.2 Wichtig (mittelfristiger Handlungsbedarf)
 
-### Priorität 2 – Mittelfristig (Architektur)
+4. **Session-Token statt deterministischem Cookie**: Der Cookie-Wert sollte um einen zufälligen, serverseitig gespeicherten Token ergänzt werden. Das erfordert eine neue Tabelle oder Nutzung der Options-Tabelle.
 
-5. **Benutzermodell in die Datenbank verlagern**  
-   Eine `yourls_users`-Tabelle mit `user_login`, `user_pass`, `user_registered`, `user_status` einführen. Dies ist die Voraussetzung für FIDO2, echte Rollenverwaltung und Session-Invalidierung.
+5. **API-Signatur-Rotation ermöglichen**: Benutzer sollten ihre API-Signatur zurücksetzen können, ohne das COOKIEKEY (das global für alle gilt) zu ändern.
 
-6. **Session-Tokens einführen**  
-   Cookie-Wert auf zufälligen Token umstellen, der in der DB gespeichert und serverseitig invalidiert werden kann.
+6. **`X-Frame-Options` durch `Content-Security-Policy: frame-ancestors` ergänzen**: `X-Frame-Options` ist veraltet; CSP `frame-ancestors` ist die moderne Alternative.
 
-7. **Content-Security-Policy**  
-   Ein klares CSP würde XSS-Risiken erheblich reduzieren. Derzeit nicht möglich ohne den Inline-JS-Code zu refaktorieren.
+7. **jQuery auf 3.7.x updaten**: Kein akutes Sicherheitsproblem, aber Wartungshygiene.
 
-### Priorität 3 – Langfristig (FIDO2/Modernisierung)
+### H.3 Strategisch (langfristiger Handlungsbedarf)
 
-8. **FIDO2-Plugin entwickeln**  
-   Als optionaler zweiter Faktor nach Passwort-Login, zunächst nur für den Admin-Bereich. Dabei `web-auth/webauthn-framework` als Library einsetzen.
+8. **Echte Benutzerverwaltung in der Datenbank**: Die Passwörter aus `config.php` in eine `yourls_users`-Tabelle migrieren. Das würde MFA, FIDO2, Passwort-Reset und Rollenverwaltung ermöglichen.
 
-9. **Theme-System einführen**  
-   Ein minimales Theme-Loader-System würde White-Labeling und Design-Erweiterungen ermöglichen, ohne Breaking Changes.
+9. **Template-Engine oder View-Schicht einführen**: HTML aus PHP-Logik trennen. Eine leichtgewichtige PHP-Template-Schicht würde das Theming vereinfachen und die Einführung von CSP erleichtern (kein Inline-JS mehr nötig).
 
-10. **JavaScript-Modernisierung**  
-    jQuery auf aktuelle Version aktualisieren oder durch native JS ersetzen.
+10. **MFA als erstem Schritt Richtung FIDO2**: Zunächst TOTP (RFC 6238) als optionalen zweiten Faktor einführen. Das ist einfacher als FIDO2 und nutzt die gleichen Erweiterungspunkte.
 
 ---
 
-## I. Möglicher Migrationspfad
+## I. Möglicher Migrationspfad (strategisch, ohne Code, ohne Änderungen)
 
-### Phase 1 – Sicherheits-Baseline (direkt umsetzbar)
-- ✅ Brute-Force-Schutz (Login-Lockout)
-- ✅ Security Headers (`X-Content-Type-Options`, `Referrer-Policy`)
-- Deprecation-Warnung für statische API-Signatur ohne Zeitstempel
-- Deprecation-Warnung für MD5-Passwörter
+### Phase 1: Sofortige Sicherheitsverbesserungen (ohne Architekturänderungen)
+- Brute-Force-Schutz für Login via Options-Tabelle
+- Fehlende Security-Header (`X-Content-Type-Options`, `Referrer-Policy`)
+- Einschränkung des `?hash=`-Parameters auf sichere Algorithmen
+- jQuery-Update
 
-### Phase 2 – Datenbankmodell für Benutzer
-- Neue Tabelle `yourls_users` in Core einführen
-- Migration der bestehenden `$yourls_user_passwords`-Einträge in die DB
-- Cookie-Wert auf DB-gespeicherte Session-Tokens umstellen
-- API-Tokens in DB verwalten
+### Phase 2: Session-Modernisierung
+- Cookie auf zufälligen Server-seitigen Session-Token umstellen
+- Logout auf Server-Seite implementieren (Token-Invalidierung)
+- Dies erfordert eine neue kleine Datenbanktabelle oder eine Erweiterung der Options-Tabelle
 
-### Phase 3 – FIDO2 als Plugin (optionaler 2. Faktor)
-- Plugin `user/plugins/webauthn/` entwickeln
-- `web-auth/webauthn-framework` als Plugin-Dependency
-- Registrierung und Verwaltung von FIDO2-Credentials in eigener DB-Tabelle
-- Login-Flow: nach Passwort → WebAuthn-Challenge → vollständiger Login
-- Admin-Seite für Schlüsselverwaltung
+### Phase 3: Echte Benutzerverwaltung
+- Migration der Passwörter aus `config.php` in eine `yourls_users`-Tabelle
+- DB-Migration über das bestehende Upgrade-System (`functions-upgrade.php`)
+- Kompatibilitätsschicht: `config.php`-Passwörter weiterhin unterstützen mit Migrationshinweis
+- Passwort-Reset-Mechanismus implementieren
 
-### Phase 4 – Passwortloser Login
-- Nach Phase 2+3: FIDO2 als primären Login-Faktor ermöglichen
-- Passkey-Only-Option (kein Passwort mehr nötig)
-- Deprecation von Passwort-Auth für Nutzer mit registrierten FIDO2-Credentials
+### Phase 4: MFA
+- TOTP als optionaler zweiter Faktor (per Plugin oder Core-Feature)
+- Datenbank-Tabelle für TOTP-Secrets pro Benutzer
+- Login-UX-Erweiterung (zweiter Schritt nach Passwort)
 
-### Phase 5 – Theme-System und UX
-- Theme-Loader einführen
-- Standardtheme refaktorieren (aus `functions-html.php` auslagern)
-- Modernes Login-UI mit Passkey-Button
+### Phase 5: FIDO2/WebAuthn
+- Nur sinnvoll nach Phase 3
+- Empfohlene Variante: FIDO2 als optionaler zweiter Faktor (neben oder statt TOTP)
+- Später: Passkeys als primäre Methode / passwortloser Login
+- Technische Voraussetzungen: User-Tabelle, Credential-Tabelle, WebAuthn-Server-Bibliothek (z.B. `web-auth/webauthn-framework`), AJAX-Endpunkte, JavaScript-Build-System
 
 ---
 
 ## J. Offene Fragen / Prüfbedarf
 
-### Auth-Logik
-- [ ] Wo genau werden fehlerhafte `$_SESSION`-Daten behandelt? (YOURLS nutzt kein `session_start()` – unklar für Plugins)
-- [ ] Ist das `shunt_is_valid_user`-Muster ausreichend dokumentiert für Plugin-Entwickler?
-- [ ] Verhalten bei gleichzeitigem Login mehrerer Benutzer mit identischem Cookie-Wert?
+### J.1 Authentifizierung
+- [ ] Wo genau werden `$yourls_user_passwords` im Code zuerst gelesen und welche Scope-Risiken bestehen?
+- [ ] Ist der Schutz gegen Timing-Attacks bei `yourls_check_password_hash()` ausreichend? (cleartext-Vergleich `===` vs. `password_verify()` – timing-safe nur beim letzteren)
+- [ ] Wie verhält sich der Cookie bei mehreren parallelen Browser-Tabs oder Geräten?
+- [ ] Welche Plugins nutzen `shunt_is_valid_user` produktiv – und könnten diese einen sicheren Auth-Bypass einführen?
 
-### Datenbankmodell
-- [ ] Gibt es Migrationsskripte (Upgrade-Funktionen in `functions-upgrade.php`)?
-- [ ] Können Plugins eigene Tabellen zuverlässig bei Deinstallation aufräumen?
+### J.2 Datenbankschema und -migration
+- [ ] Welche DB-Version (`YOURLS_DB_VERSION = '507'`) ist die aktuelle und welche Änderungen gab es zuletzt?
+- [ ] Wie skaliert das Options-Table-basierte Speichermodell bei einer Brute-Force-Schutztabelle mit vielen Einträgen?
+- [ ] Gibt es bestehende Drittanbieter-Plugins, die bereits eine User-Tabelle einführen?
 
-### Template/Theme
-- [ ] Existiert das `user/themes/`-Verzeichnis bereits und wird es je ausgewertet?
-- [ ] Welche Tests decken Theme-Funktionalität ab? (`tests/tests/themes/ThemesTest.php` – Inhalt prüfen)
+### J.3 API-Sicherheit
+- [ ] Ist der `?hash=`-Parameter in der Dokumentation (docs.yourls.org) öffentlich dokumentiert – und damit bekannt für Angreifer?
+- [ ] Gibt es Nutzungsstatistiken, welche API-Auth-Methode am häufigsten eingesetzt wird?
+- [ ] Ist ein Audit der Signatur-Berechnung auf Timing-Attacken gemacht worden?
 
-### Sicherheit
-- [ ] Wird die `YOURLS_COOKIEKEY`-Konstante gegen schwache Standardwerte geprüft?
-- [ ] Wird `YOURLS_ADMIN_SSL` in Production-Deployments standardmäßig aktiviert?
-- [ ] Gibt es ein Responsible-Disclosure-Verfahren? (keine `SECURITY.md` vorhanden)
-- [ ] Werden externe JavaScript-Ressourcen (Google Charts in `functions-html.php`) mit Subresource Integrity gesichert?
+### J.4 Plugin-Sicherheit
+- [ ] Welche Sicherheitsprüfungen durchläuft ein Plugin-Code, bevor er in `yourls_include_file_sandbox()` geladen wird?
+- [ ] Kann ein Plugin die Nonce-Prüfung (`shunt_verify_nonce`) deaktivieren?
+- [ ] Gibt es eine offizielle Plugin-Verzeichnisdokumentation, die Sicherheitsanforderungen für Plugin-Autoren formuliert?
 
-### API
-- [ ] Wann wird die statische Signatur (`?signature=...` ohne Zeitstempel) depreciert?
-- [ ] Gibt es eine dokumentierte API-Versionierung?
+### J.5 Frontend / CSP
+- [ ] An wie vielen Stellen im Core wird Inline-JavaScript verwendet? (Eine CSP-Einführung müsste alle diese Stellen identifizieren)
+- [ ] Gibt es bereits Pläne oder Issues für das Entfernen von Inline-JavaScript?
+- [ ] Kann das bestehende Theme-System für Admin-Bereich-Theming erweitert werden, ohne Breaking Changes?
 
-### FIDO2
-- [ ] Welche PHP-Versionen sollen bei FIDO2-Integration unterstützt werden? (`web-auth/webauthn-framework` erfordert PHP 8.1+)
-- [ ] Soll FIDO2 per Plugin oder per Core-Feature eingeführt werden?
-- [ ] Wie sollen bestehende Nutzer (ohne DB-ID) beim Übergang zu Phase 2 migriert werden?
+### J.6 Dokumentation
+- [ ] Existiert eine SECURITY.md oder ein equivalenter Prozess für verantwortungsvolle Offenlegung von Sicherheitslücken?
+- [ ] Sind die auf docs.yourls.org beschriebenen Sicherheitshinweise (z.B. `YOURLS_COOKIEKEY`, `YOURLS_PRIVATE`) noch aktuell mit dem Code-Stand?
 
 ---
 
-*Dieser Bericht basiert auf statischer Codeanalyse. Dynamische Sicherheitstests (z. B. Fuzzing, Penetrationstests, Header-Scans in einer Live-Umgebung) sind empfohlen, um die hier gemachten Einschätzungen zu verifizieren.*
+*Hinweis: Diese Analyse ist eine reine Bestandsaufnahme. Es wurden keinerlei Änderungen am Projekt vorgenommen. Alle Empfehlungen sind ausschließlich textuell formuliert.*
