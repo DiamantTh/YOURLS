@@ -193,6 +193,14 @@ class Config {
         if (!defined( 'YOURLS_NONCE_LIFE' ))
             define( 'YOURLS_NONCE_LIFE', 43200 ); // 3600 * 12
 
+        // maximum number of failed login attempts before an IP is temporarily locked out (0 to disable)
+        if (!defined( 'YOURLS_LOGIN_MAX_ATTEMPTS' ))
+            define( 'YOURLS_LOGIN_MAX_ATTEMPTS', 5 );
+
+        // duration in seconds an IP is locked out after exceeding YOURLS_LOGIN_MAX_ATTEMPTS (default: 15 minutes)
+        if (!defined( 'YOURLS_LOGIN_LOCKOUT_DURATION' ))
+            define( 'YOURLS_LOGIN_LOCKOUT_DURATION', 900 );
+
         // if set to true, disable stat logging (no use for it, too busy servers, ...)
         if (!defined( 'YOURLS_NOSTATS' ))
             define( 'YOURLS_NOSTATS', false );

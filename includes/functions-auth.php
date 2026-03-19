@@ -135,11 +135,124 @@ function yourls_check_username_password() {
         yourls_verify_nonce('admin_login');
     }
 
+    // Check if the client IP is currently locked out due to too many failed attempts
+    if ( !yourls_check_login_attempts() ) {
+        return false;
+    }
+
     if( isset( $yourls_user_passwords[ $_REQUEST['username'] ] ) && yourls_check_password_hash( $_REQUEST['username'], $_REQUEST['password'] ) ) {
+        yourls_reset_login_attempts();
         yourls_set_user( $_REQUEST['username'] );
         return true;
     }
+
+    yourls_record_failed_login();
     return false;
+}
+
+/**
+ * Check if the current client IP has exceeded the maximum number of failed login attempts.
+ *
+ * Returns true if login is permitted, false if the IP is currently locked out.
+ * Lockouts expire automatically after YOURLS_LOGIN_LOCKOUT_DURATION seconds.
+ * Set YOURLS_LOGIN_MAX_ATTEMPTS to 0 to disable the lockout mechanism entirely.
+ *
+ * @since 1.10.4
+ * @param  string $ip  Optional IP address, defaults to current client IP
+ * @return bool        true if login is allowed, false if locked out
+ */
+function yourls_check_login_attempts( $ip = '' ) {
+    // Allow plugins to short-circuit the whole function
+    $pre = yourls_apply_filter( 'shunt_check_login_attempts', yourls_shunt_default(), $ip );
+    if ( yourls_shunt_default() !== $pre ) {
+        return $pre;
+    }
+
+    $max_attempts = yourls_apply_filter( 'max_login_attempts', YOURLS_LOGIN_MAX_ATTEMPTS );
+
+    // Feature is disabled
+    if ( $max_attempts === 0 ) {
+        return true;
+    }
+
+    if ( !$ip ) {
+        $ip = yourls_get_IP();
+    }
+
+    $key  = 'failed_login_' . yourls_salt( $ip );
+    $data = yourls_get_option( $key );
+
+    if ( !$data ) {
+        return true;
+    }
+
+    $data = json_decode( $data, true );
+    if ( !is_array( $data ) || !isset( $data['count'] ) || (int)$data['count'] < $max_attempts ) {
+        return true;
+    }
+
+    // IP has exceeded max attempts — check whether the lockout period has expired
+    $lockout_duration = yourls_apply_filter( 'login_lockout_duration', YOURLS_LOGIN_LOCKOUT_DURATION );
+    $last_attempt     = isset( $data['last'] ) ? (int)$data['last'] : 0;
+
+    if ( time() > $last_attempt + $lockout_duration ) {
+        // Lockout expired — clean up and allow
+        yourls_reset_login_attempts( $ip );
+        return true;
+    }
+
+    yourls_do_action( 'login_locked_out', $ip, (int)$data['count'], $last_attempt + $lockout_duration );
+    return false;
+}
+
+/**
+ * Record a failed login attempt for the current (or given) client IP address
+ *
+ * @since 1.10.4
+ * @param  string $ip  Optional IP address, defaults to current client IP
+ * @return void
+ */
+function yourls_record_failed_login( $ip = '' ) {
+    if ( !$ip ) {
+        $ip = yourls_get_IP();
+    }
+
+    $key  = 'failed_login_' . yourls_salt( $ip );
+    $data = yourls_get_option( $key );
+
+    if ( !$data ) {
+        $data = [ 'count' => 0, 'first' => time(), 'last' => time() ];
+    } else {
+        $data = json_decode( $data, true );
+        if ( !is_array( $data ) ) {
+            $data = [ 'count' => 0, 'first' => time(), 'last' => time() ];
+        }
+    }
+
+    $data['count'] = (int)( $data['count'] ?? 0 ) + 1;
+    $data['last']  = time();
+
+    yourls_update_option( $key, json_encode( $data ) );
+    yourls_do_action( 'failed_login', $ip, (int)$data['count'] );
+}
+
+/**
+ * Reset the failed login attempt counter for the current (or given) client IP address
+ *
+ * Should be called after a successful login to clear any previously recorded failures.
+ *
+ * @since 1.10.4
+ * @param  string $ip  Optional IP address, defaults to current client IP
+ * @return void
+ */
+function yourls_reset_login_attempts( $ip = '' ) {
+    if ( !$ip ) {
+        $ip = yourls_get_IP();
+    }
+
+    $key = 'failed_login_' . yourls_salt( $ip );
+    yourls_delete_option( $key );
+    yourls_do_action( 'login_attempts_reset', $ip );
 }
 
 /**

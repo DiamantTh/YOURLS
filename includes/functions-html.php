@@ -65,6 +65,7 @@ function yourls_html_head( $context = 'index', $title = '' ) {
     if( yourls_is_admin() && !headers_sent() ) {
         yourls_no_cache_headers();
         yourls_no_frame_header();
+        yourls_security_headers();
         yourls_content_type_header( yourls_apply_filter( 'html_head_content-type', 'text/html' ) );
         yourls_do_action( 'admin_headers', $context, $title );
     }

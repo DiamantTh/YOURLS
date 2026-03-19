@@ -367,6 +367,40 @@ function yourls_no_frame_header() {
 }
 
 /**
+ * Send additional security-related HTTP headers for admin pages
+ *
+ * Sends:
+ *  - X-Content-Type-Options: nosniff  (prevent MIME-type sniffing attacks)
+ *  - Referrer-Policy: strict-origin-when-cross-origin  (limit referrer leakage)
+ *
+ * The whole function is filterable via 'shunt_security_headers'.
+ * Individual headers are filterable via 'security_headers'.
+ *
+ * @since 1.10.4
+ * @return void|mixed
+ */
+function yourls_security_headers() {
+    // Allow plugins to short-circuit the whole function
+    $pre = yourls_apply_filter( 'shunt_security_headers', yourls_shunt_default() );
+    if ( yourls_shunt_default() !== $pre ) {
+        return $pre;
+    }
+
+    if ( headers_sent() ) {
+        return;
+    }
+
+    $headers = yourls_apply_filter( 'security_headers', [
+        'X-Content-Type-Options' => 'nosniff',
+        'Referrer-Policy'        => 'strict-origin-when-cross-origin',
+    ] );
+
+    foreach ( $headers as $name => $value ) {
+        header( $name . ': ' . $value );
+    }
+}
+
+/**
  * Send a filterable content type header
  *
  * @since 1.7
